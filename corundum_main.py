@@ -25,6 +25,9 @@ CorundumGoal    = _im("corundum_goal").CorundumGoal
 CorundumLogic   = _im("corundum_logic").CorundumLogic
 MetricsEngine   = _im("corundum_metrics").MetricsEngine
 
+from corundum_agency import CorundumAgency
+from corundum_voice  import make_listener
+
 try:
     from ollama import AsyncClient as OllamaClient
     OLLAMA_OK = True
@@ -119,10 +122,26 @@ class Corundum:
         self.goal    = CorundumGoal()
         self.logic   = CorundumLogic()
 
-        self.running:            bool  = False
-        self.last_input_t:       float = time.time()
-        self.interaction_count:  int   = 0
-        self._bg_tasks:          set   = set()
+        # agency (린 구조)
+        self.agency = CorundumAgency(safe_mode=True)
+        self.agency.attach(self)
+
+        # 음성
+        self.voice = make_listener(
+            wake_name  = Cfg.WAKE_NAME,
+            on_wake    = self._on_voice_wake,
+            on_command = self._on_voice_command,
+            model_size = getattr(Cfg, "WHISPER_MODEL", "small"),
+        )
+
+        # DORMANT: True면 LLM 호출 없음. 호출어/키보드로 깨어남.
+        self._dormant: bool = True
+        self.on_autonomous: Optional[Callable] = None
+
+        self.running:           bool  = False
+        self.last_input_t:      float = time.time()
+        self.interaction_count: int   = 0
+        self._bg_tasks:         set   = set()
 
         self._nx_task:      Optional[asyncio.Task] = None
         self._nx_interrupt: asyncio.Event          = asyncio.Event()
@@ -142,7 +161,17 @@ class Corundum:
     # ── main process ──────────────────────────────────────────────────────────
 
     async def process(self, user_input: str) -> str:
+        if self._dormant:
+            return ""
         self.last_input_t = time.time()
+
+        # agency 임무 감지
+        agency_result = await self.agency.on_impulse(user_input, {})
+        if agency_result and agency_result.get("task_started"):
+            return (
+                f"임무 시작: {agency_result['goal'][:60]}\n"
+                "잠수합니다. 완료되면 알려드릴게요. (/abort 로 중단)"
+            )
 
         if self._nx_task and not self._nx_task.done():
             self._nx_interrupt.set()
@@ -211,21 +240,23 @@ class Corundum:
 
     async def _autonomous_loop(self):
         while self.running:
-            await asyncio.sleep(Cfg.AUTO_INTERVAL)
+            interval = (
+                getattr(Cfg, "DORMANT_AUTO_INTERVAL", 120.0)
+                if self._dormant else Cfg.AUTO_INTERVAL
+            )
+            await asyncio.sleep(interval)
+            if self._dormant or self.agency.is_running:
+                continue
             idle = time.time() - self.last_input_t
             if idle < Cfg.AUTO_IDLE_THRESHOLD:
                 continue
-
             metrics_ctx = self.metrics.tick(idle_sec=idle)
             gear        = metrics_ctx.get("gear", "NORMAL")
-
             result = await self.goal.autonomous_tick(metrics_ctx)
             if result:
                 print(f"\n[autonomous] {result}")
-
             if gear in ("SAVE", "LOW", "SLEEP", "DREAM"):
                 continue
-
             asyncio.create_task(self._cogn_tick(metrics_ctx))
 
     async def _cogn_tick(self, metrics_ctx: dict):
@@ -368,14 +399,15 @@ class Corundum:
             idle  = time.time() - self.last_input_t
             state = self.metrics.tick(idle_sec=idle)
             gear  = state.get("gear", "NORMAL")
-
             self.emotion.physio_tick(idle_sec=idle)
-
             if gear in ("SLEEP", "DREAM"):
                 await self.memory.consolidate()
-
-            interval = Cfg.GEAR_INTERVALS.get(gear, 20.0)
+            if self._dormant:
+                interval = getattr(Cfg, "DORMANT_PHYSIO_INTERVAL", 30.0)
+            else:
+                interval = Cfg.GEAR_INTERVALS.get(gear, 20.0)
             await asyncio.sleep(min(interval, 30.0))
+            await self.agency.tick(state)
 
     # ── chat loop ─────────────────────────────────────────────────────────────
 
@@ -383,14 +415,17 @@ class Corundum:
         self.running = True
         loop         = asyncio.get_event_loop()
 
-        print("(종료: quit)")
+        print(f"DORMANT — \"{Cfg.WAKE_NAME}\" 라고 부르거나 아무 키나 누르세요.\n")
 
         physio_task = asyncio.create_task(self._physio_loop())
         auto_task   = asyncio.create_task(self._autonomous_loop())
 
+        self.on_autonomous = lambda msg: print(f"\n코런덤: {msg}")
+        await self.voice.start()
+
         while self.running:
             try:
-                user_input = await loop.run_in_executor(None, input, "\n나: ")
+                user_input = await loop.run_in_executor(None, input, "")
             except (EOFError, KeyboardInterrupt):
                 break
 
@@ -399,6 +434,21 @@ class Corundum:
                 continue
             if user_input.lower() in ("quit", "exit", "종료", "끝"):
                 break
+
+            # 키보드 입력 → DORMANT 해제
+            if self._dormant:
+                self._dormant = False
+                self.voice.force_awake()
+                print("\n코런덤: 네.")
+
+            # 임무 중 잠수
+            if self.agency.is_running:
+                c = user_input.strip().lower()
+                if c in ("/abort", "abort", "중단", "멈춰", "그만"):
+                    print(f"\n코런덤: {self.agency.abort()}")
+                else:
+                    print(f"\n코런덤: {self.agency.dive_response()}")
+                continue
 
             if user_input.startswith("/"):
                 response = await self._handle_command(user_input)
@@ -410,9 +460,36 @@ class Corundum:
 
         physio_task.cancel()
         auto_task.cancel()
+        self.voice.stop()
         await asyncio.gather(physio_task, auto_task, return_exceptions=True)
         await self.memory.save()
         print("\n[ CORUNDUM session ended ]")
+
+    # ── 음성 콜백 ─────────────────────────────────────────────────────────────
+
+    async def _on_voice_wake(self, remainder: str = ""):
+        if self._dormant:
+            self._dormant = False
+            print("\n코런덤: 네.")
+        if remainder:
+            await self._on_voice_command(remainder)
+
+    async def _on_voice_command(self, text: str):
+        if not text:
+            return
+        print(f"\n[음성] {text}")
+        if self.agency.is_running:
+            if text.strip().lower() in ("abort", "중단", "멈춰", "그만"):
+                print(f"코런덤: {self.agency.abort()}")
+            else:
+                print(f"코런덤: {self.agency.dive_response()}")
+            return
+        if text.startswith("/"):
+            response = await self._handle_command(text)
+        else:
+            response = await self.process(text)
+        if response:
+            print(f"코런덤: {response}")
 
     # ── command handler ───────────────────────────────────────────────────────
 
@@ -535,21 +612,57 @@ class Corundum:
                 f"  error rate:   {gs.get('error_rate', 0.0):.0%}"
             )
 
-        elif c in ("/help", "/?"): 
+        elif c in ("/help", "/?"):
             return "\n".join([
-                "/status              — current state",
-                "/goals               — goal list",
-                "/goal <n>            — add goal",
-                "/memory              — recent memory",
-                "/kg [query]          — knowledge graph",
-                "/review <code>       — code review (file path ok)",
-                "/edit <file> <inst>  — edit file per instruction (auto backup)",
-                "/write <file> <desc> — write new file from description",
-                "/design <topic>      — design analysis",
-                "/stats               — statistics",
-                "/help                — this message",
-                "quit                 — exit",
+                "/status              — 현재 상태",
+                "/goals               — 목표 목록",
+                "/goal <n>            — 목표 추가",
+                "/memory              — 최근 기억",
+                "/kg [query]          — 지식 그래프",
+                "/review <code>       — 코드 리뷰 (파일 경로 가능)",
+                "/edit <file> <inst>  — 파일 수정 (자동 백업)",
+                "/write <file> <desc> — 새 파일 작성",
+                "/design <topic>      — 설계 분석",
+                "/task <description>  — 임무 부여 (잠수 모드)",
+                "/abort               — 임무 중단",
+                "/computer <goal>     — 컴퓨터 직접 제어",
+                "/agency              — agency 상태",
+                "/dormant             — 대기 모드 전환",
+                "/stats               — 통계",
+                "/help                — 이 메시지",
+                "quit                 — 종료",
             ])
+
+        elif c == "/task":
+            if len(parts) < 2:
+                return "usage: /task <임무 설명>"
+            description = " ".join(parts[1:])
+            def _cb(msg): print(f"  {msg}")
+            await self.agency.do_task(description, on_status=_cb)
+            return (
+                f"임무 시작: {description[:60]}\n"
+                "잠수합니다. 완료되면 알려드릴게요. (/abort 로 중단)"
+            )
+
+        elif c == "/abort":
+            return self.agency.abort()
+
+        elif c == "/computer":
+            if len(parts) < 2:
+                return "usage: /computer <goal>"
+            goal   = " ".join(parts[1:])
+            result = await self.agency.do_computer(goal)
+            status = "완료" if result.get("success") else "실패"
+            output = result.get("output", "")[:300]
+            return f"[computer] {status}: {result.get('reason','')}\n{output}" if output else f"[computer] {status}"
+
+        elif c == "/agency":
+            return self.agency.status_str()
+
+        elif c == "/dormant":
+            self._dormant = True
+            self.voice.force_dormant()
+            return f"대기 모드. \"{Cfg.WAKE_NAME}\" 라고 불러주세요."
 
         return f"알 수 없는 명령어예요: {c}  (/help 참고)"
 

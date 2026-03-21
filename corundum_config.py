@@ -74,3 +74,11 @@ class Cfg:
 
     CRISIS_CHECK_INTERVAL = 10.0
     CRISIS_CONFIRM_COUNT  = 2
+
+    # ── 음성 + 대기 모드 ───────────────────────────────────────────────────────
+    WAKE_NAME               = os.environ.get("CORUNDUM_WAKE_NAME", "코런덤")
+    WHISPER_MODEL           = os.environ.get("CORUNDUM_WHISPER_MODEL", "small")
+    VOICE_ENABLED           = os.environ.get("CORUNDUM_VOICE", "1") == "1"
+    DORMANT_PHYSIO_INTERVAL = 30.0
+    DORMANT_AUTO_INTERVAL   = 120.0
+
