@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # corundum_agency.py
-# CorundumAgency — 린(CitrineAgency) 구조 그대로 이식
+# CorundumAgency — 에이전시 메인 모듈
 #
 # 구성:
-#   CorundumVision      — 화면 캡처 + ollama 비전 이해 (린 CitrineVision)
-#   CorundumActor       — 실제 입력 실행 (린 CitrineActor)
-#   CorundumSemanticAnchor — AT-SPI → UIAuto → OCR → VLM 폴백 (린 CitrineSemanticAnchor)
-#   CorundumBrain       — 화면 보고 다음 행동 결정 루프 (린 CitrineBrain)
-#   CorundumComputer    — Brain 래퍼 (린 CitrineComputer)
+#   CorundumVision      — 화면 캡처 + LLM 비전 분석
+#   CorundumActor       — GUI + 터미널 + 파일 실행
+#   CorundumSemanticAnchor — AT-SPI → UIAuto → OCR 폴백
+#   CorundumBrain       — 화면 보고 행동 결정
+#   CorundumComputer    — Brain 래퍼
 #   CorundumWeb         — 검색 + 요약
 #   CorundumTask        — 임무 상태 머신 (IDLE→RUNNING→DONE, 잠수 모드)
-#   CorundumAgency      — 메인 통합 (린 CitrineAgency)
+#   CorundumAgency      — 메인 통합
 #
 # 핵심 API:
 #   agency = CorundumAgency()
@@ -118,7 +118,7 @@ def _get_cfg():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CorundumVision — 화면 캡처 + 이해 (린 CitrineVision 이식)
+#  CorundumVision — 화면 캡처 + LLM 비전 분석
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -133,7 +133,6 @@ class ScreenState:
 
 
 class CorundumVision:
-    # 코런덤 특화: 코드/터미널 화면에 집중
     _VIS_SYS = (
         "/no_think\n"
         "화면 스크린샷을 보고 JSON으로 반환해:\n"
@@ -185,7 +184,6 @@ class CorundumVision:
                 state.description = data.get("description", "")
                 state.focused_app = data.get("focused_app", "")
                 state.ocr_text    = data.get("text_content", "")
-                # 오류 감지 힌트 첨부
                 if data.get("has_error") == "true" and data.get("error_summary"):
                     state.description += f" [오류: {data['error_summary']}]"
         except Exception as e:
@@ -194,7 +192,7 @@ class CorundumVision:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CorundumActor — 실제 입력 실행 (린 CitrineActor 이식)
+#  CorundumActor — 실제 입력 실행
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -314,7 +312,7 @@ class CorundumActor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CorundumSemanticAnchor (린 CitrineSemanticAnchor 이식)
+#  CorundumSemanticAnchor — UI 요소 의미 기반 탐색
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -437,11 +435,10 @@ class CorundumSemanticAnchor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CorundumBrain — 화면 보고 행동 결정 루프 (린 CitrineBrain 이식)
+#  CorundumBrain — 화면 보고 행동 결정 루프
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CorundumBrain:
-    # 코런덤 특화: 터미널/코드 작업 우선, 오류 감지 시 즉시 수정
     _ACT_SYS = (
         "/no_think\n"
         "너는 코런덤의 컴퓨터 조작 모듈이야.\n"
@@ -488,7 +485,6 @@ class CorundumBrain:
             OLLAMA_OK = False
 
         for step_n in range(self.MAX_STEPS):
-            # 화면 캡처 + 이해
             state = self.vision.capture()
             if state.b64:
                 try:
@@ -546,7 +542,6 @@ class CorundumBrain:
                 safe=action_data.get("safe", True),
             )
 
-            # SemanticAnchor 좌표 보정
             if (action.action_type in ("click", "double_click")
                     and action_data.get("target_text")):
                 elem = await self.anchor.find_element(
@@ -605,7 +600,7 @@ class CorundumBrain:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CorundumComputer (린 CitrineComputer 이식)
+#  CorundumComputer — Brain 래퍼
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CorundumComputer:
@@ -741,7 +736,6 @@ class CorundumWeb:
         except Exception as e:
             doc.error = str(e)[:80]
 
-        # 요약
         if doc.raw_text and not doc.error:
             try:
                 from ollama import AsyncClient
@@ -848,7 +842,7 @@ class Task:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CorundumAgency — 메인 통합 (린 CitrineAgency 구조)
+#  CorundumAgency — 메인 통합
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CorundumAgency:
@@ -886,13 +880,12 @@ class CorundumAgency:
         self._dive_idx += 1
         return msg
 
-    # ── 훅 (린 on_impulse 구조) ───────────────────────────────────────────────
+    # ── 훅 ───────────────────────────────────────────────────────────────────
 
     async def on_impulse(self, impulse_text: str, ctx: Dict) -> Optional[Dict]:
         """process()에서 호출. 임무 키워드 감지 시 do_task 시작."""
         if self.is_running:
             return None
-        # 임무 키워드 감지
         task_goal = self._detect_task(impulse_text)
         if task_goal:
             await self.do_task(task_goal)
@@ -935,7 +928,7 @@ class CorundumAgency:
         if self._task:
             self._task.state       = TaskState.ABORTED
             self._task.finished_at = time.time()
-        # Corundum DORMANT 해제 (중단 후 대화 가능하게)
+      
         if self._corundum:
             self._corundum._dormant = False
         return "임무 중단됐어요."
@@ -954,7 +947,6 @@ class CorundumAgency:
         try:
             on_status(f"[임무 시작] {task.description[:60]}")
 
-            # 검색 필요 여부 판단
             needs_web = any(
                 kw in task.description
                 for kw in ["검색", "찾아", "조사", "문서", "어떻게", "방법", "search"]
@@ -974,8 +966,7 @@ class CorundumAgency:
                 self._notify_done(task)
                 return
 
-            # 컴퓨터 실행
-            goal_with_context = task.description
+                goal_with_context = task.description
             if web_context:
                 goal_with_context = f"{task.description}\n\n참고:\n{web_context[:500]}"
 
@@ -1007,7 +998,6 @@ class CorundumAgency:
     def _notify_done(self, task: Task):
         if not self._corundum:
             return
-        # 임무 완료 → Corundum DORMANT 해제 + 결과 출력
         on_auto = getattr(self._corundum, "on_autonomous", None)
         if on_auto:
             on_auto(task.summary())

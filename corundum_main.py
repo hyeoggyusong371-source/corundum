@@ -122,11 +122,9 @@ class Corundum:
         self.goal    = CorundumGoal()
         self.logic   = CorundumLogic()
 
-        # agency (린 구조)
         self.agency = CorundumAgency(safe_mode=True)
         self.agency.attach(self)
 
-        # 음성
         self.voice = make_listener(
             wake_name  = Cfg.WAKE_NAME,
             on_wake    = self._on_voice_wake,
@@ -134,7 +132,7 @@ class Corundum:
             model_size = getattr(Cfg, "WHISPER_MODEL", "small"),
         )
 
-        # DORMANT: True면 LLM 호출 없음. 호출어/키보드로 깨어남.
+        # DORMANT 모드: 호출어/키보드로 깨어날 때까지 LLM 호출 없음
         self._dormant: bool = True
         self.on_autonomous: Optional[Callable] = None
 
@@ -165,7 +163,6 @@ class Corundum:
             return ""
         self.last_input_t = time.time()
 
-        # agency 임무 감지
         agency_result = await self.agency.on_impulse(user_input, {})
         if agency_result and agency_result.get("task_started"):
             return (
@@ -186,11 +183,9 @@ class Corundum:
 
         metrics_ctx = self.metrics.tick(idle_sec=idle, interaction_count=self.interaction_count)
 
-        # memory / emotion / goal / judge 4개 동시 실행 후 gather
         memory_task  = asyncio.create_task(self.memory.recall(user_input, metrics_ctx))
         emotion_task = asyncio.create_task(self.emotion.process(user_input, metrics_ctx))
         goal_task    = asyncio.create_task(self.goal.process(user_input, metrics_ctx))
-        # episodes는 memory 로드 전에 None일 수 있으므로 getattr로 안전하게 접근
         _episodes    = getattr(self.memory, "episodes", None)
         _working_ctx = _episodes.working_context(n=4) if _episodes else ""
         judge_ctx    = {**metrics_ctx, "working_memory": _working_ctx}
@@ -435,13 +430,11 @@ class Corundum:
             if user_input.lower() in ("quit", "exit", "종료", "끝"):
                 break
 
-            # 키보드 입력 → DORMANT 해제
             if self._dormant:
                 self._dormant = False
                 self.voice.force_awake()
                 print("\n코런덤: 네.")
 
-            # 임무 중 잠수
             if self.agency.is_running:
                 c = user_input.strip().lower()
                 if c in ("/abort", "abort", "중단", "멈춰", "그만"):
@@ -550,13 +543,10 @@ class Corundum:
             elif p.exists() and p.is_dir():
                 return f"디렉토리는 리뷰할 수 없어요: {target}"
             elif "/" in target or "\\" in target:
-                # 경로처럼 보이는데 파일이 없는 경우
-                return f"파일을 찾을 수 없어요: {target}"
-            # 경로가 아니면 코드 문자열로 그대로 리뷰
+                    return f"파일을 찾을 수 없어요: {target}"
             return await self.logic.review(target, ctx=self.metrics.snapshot())
 
         elif c == "/edit":
-            # usage: /edit <filepath> <instruction>
             if len(parts) < 3:
                 return "usage: /edit <filepath> <instruction>"
             from pathlib import Path
@@ -572,14 +562,12 @@ class Corundum:
             code = await self.logic.edit(filepath, instruction, original, ctx=self.metrics.snapshot())
             if not code or code == original:
                 return "수정 사항이 없거나 생성 실패예요."
-            # 백업 후 덮어쓰기
             backup = p.with_suffix(p.suffix + ".bak")
             backup.write_text(original, encoding="utf-8")
             p.write_text(code, encoding="utf-8")
             return f"수정 완료 → {filepath}\n백업 → {backup}\n\n```python\n{code[:800]}{'...' if len(code) > 800 else ''}\n```"
 
         elif c == "/write":
-            # usage: /write <filepath> <description>
             if len(parts) < 3:
                 return "usage: /write <filepath> <description>"
             from pathlib import Path
