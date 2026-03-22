@@ -33,6 +33,15 @@ def _inject_core(sys_p: str) -> str:
         return sys_p
     return sys_p + "\n\n" + _CORUNDUM_CORE
 
+
+def _thinking_prefix(complexity: int) -> str:
+    """
+    Qwen3 thinking mode prefix.
+    complexity 0-1 → /no_think (빠름)
+    complexity 2-3 → /think   (깊게)
+    """
+    return "/think\n" if complexity >= 2 else "/no_think\n"
+
 CTX_MODE_FULL    = "full"     # 감정·목표·기억 전부 포함
 CTX_MODE_DEEP    = "deep"     # inner_hint + kg + self_critique 위주 (리뷰/설계용)
 CTX_MODE_MINIMAL = "minimal"  # 상태 한 줄만 (CriticGuard용)
@@ -122,7 +131,12 @@ class InnerJudge:
         + "[판단] 1~2문장\n"
         + "[의심] 1문장\n"
         + "[결론]\n"
-        + '{"judge_text":"","skepticism_boost":false,"action":"speak|silent|deep_review","urgency":0.0,"focus_hint":""}\n\n'
+        + '{"judge_text":"","skepticism_boost":false,"action":"speak|silent|deep_review","urgency":0.0,"focus_hint":"","complexity":1}\n\n'
+        + "complexity 기준:\n"
+        + "  0=LITE  : 잡담/단순사실/짧은 질문\n"
+        + "  1=NORMAL: 일반 분석/설명\n"
+        + "  2=DEEP  : 코드리뷰/설계/버그/보안\n"
+        + "  3=ULTRA : 보안취약점/아키텍처 전면검토/크리티컬 버그\n"
         + "deep_review: 코드블록/리뷰/설계/버그 키워드 포함 시"
     )
 
@@ -134,8 +148,9 @@ class InnerJudge:
             "action":           {"type": "string", "enum": ["speak", "silent", "deep_review"]},
             "urgency":          {"type": "number"},
             "focus_hint":       {"type": "string"},
+            "complexity":       {"type": "integer"},
         },
-        "required": ["judge_text", "skepticism_boost", "action", "urgency", "focus_hint"],
+        "required": ["judge_text", "skepticism_boost", "action", "urgency", "focus_hint", "complexity"],
     }
 
     def __init__(self):
@@ -174,13 +189,18 @@ class InnerJudge:
         return '{"judge_text":"검토 중","skepticism_boost":false,"action":"speak","urgency":0.5,"focus_hint":""}'
 
     def _parse(self, raw):
-        _FB = {"judge_text": "...", "skepticism_boost": False, "action": "speak", "urgency": 0.5, "focus_hint": ""}
+        _FB = {"judge_text": "...", "skepticism_boost": False, "action": "speak", "urgency": 0.5, "focus_hint": "", "complexity": 1}
         try:
             result = json.loads(raw)
         except:
             result = _safe_parse_json(raw, default_fallback=_FB)
         if result.get("action") not in ("speak", "silent", "deep_review"):
             result["action"] = "speak"
+        # complexity 범위 보정
+        try:
+            result["complexity"] = max(0, min(3, int(result.get("complexity", 1))))
+        except (TypeError, ValueError):
+            result["complexity"] = 1
         return result
 
 
@@ -294,14 +314,15 @@ class LogicCore:
 
     async def generate(self, user_input, judge, ctx):
         self.call_count += 1
-        _ctx_mode = CTX_MODE_DEEP if judge.get("action") == "deep_review" else CTX_MODE_FULL
-        ctx_str   = await _build_ctx_str(ctx, mode=_ctx_mode)
-        sys_p     = self.SYS_REVIEW if judge.get("action") == "deep_review" else self.SYS_BASE
-        parts     = [f"사용자: {user_input}"]
+        _ctx_mode   = CTX_MODE_DEEP if judge.get("action") == "deep_review" else CTX_MODE_FULL
+        ctx_str     = await _build_ctx_str(ctx, mode=_ctx_mode)
+        sys_p       = self.SYS_REVIEW if judge.get("action") == "deep_review" else self.SYS_BASE
+        think_pfx   = judge.get("_think_prefix", "/no_think\n")
+        parts       = [f"사용자: {user_input}"]
         if judge.get("_judge_raw"):  parts.append(f"[내면 판단] {judge['_judge_raw']}")
         if judge.get("_doubt_raw"):  parts.append(f"[의심 포인트] {judge['_doubt_raw']}")
         if judge.get("focus_hint"):  parts.append(f"[집중 포인트] {judge['focus_hint']}")
-        return await self._call(f"{ctx_str}\n\n" + "\n".join(parts), sys_p, Cfg.TEMP_LOGIC, Cfg.TIMEOUT_LOGIC)
+        return await self._call(think_pfx + f"{ctx_str}\n\n" + "\n".join(parts), sys_p, Cfg.TEMP_LOGIC, Cfg.TIMEOUT_LOGIC)
 
     async def revise(self, user_input, draft_text, critic_result, ctx):
         self.call_count += 1
@@ -401,8 +422,12 @@ class CorundumLogic:
 
     async def process(self, user_input, ctx, judge_result=None):
         """
-        메인 파이프라인: judge → generate (병렬 ctx_str 빌드) → critic → (revise).
-        judge action이 silent이면 빈 문자열 반환, deep_review면 review/design 라우팅.
+        Adaptive Thinking 파이프라인.
+
+        complexity 0 LITE  : Logic only, /no_think, Critic 스킵
+        complexity 1 NORMAL: Logic → Critic
+        complexity 2 DEEP  : Logic → Critic → revise  (기존 동일)
+        complexity 3 ULTRA : Logic → Critic → revise → 2차 Critic
         """
         self.call_count += 1
         if judge_result is None:
@@ -421,6 +446,22 @@ class CorundumLogic:
         if judge_result.get("skepticism_boost"):
             ctx["skepticism"] = clamp(ctx.get("skepticism", 0.50) + 0.15)
 
+        complexity = judge_result.get("complexity", 1)
+        # thinking prefix를 judge_result에 실어서 LogicCore._call이 꺼내 쓸 수 있게
+        judge_result["_think_prefix"] = _thinking_prefix(complexity)
+
+        log.debug("adaptive: complexity=%d user=%s", complexity, user_input[:30])
+
+        # ── LITE: Critic 없이 빠르게 ────────────────────────────────────────
+        if complexity == 0:
+            async with self.heavy_sem:
+                draft = await self.logic.generate(user_input, judge_result, ctx)
+            if not draft:
+                return "음... 지금은 적절한 답을 못 찾겠어요."
+            self._record(user_input, draft, "lite")
+            return draft
+
+        # ── NORMAL / DEEP / ULTRA: Logic + Critic ───────────────────────────
         async def _gen():
             async with self.heavy_sem:
                 return await self.logic.generate(user_input, judge_result, ctx)
@@ -429,32 +470,50 @@ class CorundumLogic:
             _gen(), _build_ctx_str(ctx, mode=CTX_MODE_MINIMAL),
             return_exceptions=True,
         )
-        # draft와 critic용 ctx_str을 동시에 빌드해서 CriticGuard 대기 시간 단축
 
         if isinstance(draft, Exception) or not draft:
             return "음... 지금은 적절한 답을 못 찾겠어요."
         if isinstance(critic_ctx_str, Exception):
             critic_ctx_str = ""
 
-        async def _crit():
+        async def _crit(target_text):
             async with self.heavy_sem:
-                return await self.critic.check(draft, judge_result, ctx, prebuilt_ctx_str=critic_ctx_str)
+                return await self.critic.check(target_text, judge_result, ctx, prebuilt_ctx_str=critic_ctx_str)
 
         try:
-            critic_result = await asyncio.wait_for(_crit(), timeout=Cfg.TIMEOUT_CRITIC + 5.0)
+            critic_result = await asyncio.wait_for(_crit(draft), timeout=Cfg.TIMEOUT_CRITIC + 5.0)
         except:
             critic_result = {"action": "pass", "reason": "", "sharpness_note": ""}
 
         c_action = critic_result.get("action", "pass")
-        if c_action == "pass":
-            self._record(user_input, draft, "pass")
+
+        # NORMAL: revise 없이 반환
+        if complexity == 1:
+            if c_action != "pass":
+                log.debug("adaptive: normal critic %s — skipping revise", c_action)
+            self._record(user_input, draft, f"normal_{c_action}")
             return draft
+
+        # DEEP / ULTRA: revise
         if c_action in ("flag", "veto") and self.MAX_REVISE > 0:
-            revised = await self.logic.revise(user_input, draft, critic_result, ctx)
+            async with self.heavy_sem:
+                revised = await self.logic.revise(user_input, draft, critic_result, ctx)
             if revised:
-                self._record(user_input, revised, c_action)
+                # ULTRA: 2차 Critic
+                if complexity == 3:
+                    try:
+                        critic2 = await asyncio.wait_for(
+                            _crit(revised), timeout=Cfg.TIMEOUT_CRITIC + 5.0
+                        )
+                        c2_action = critic2.get("action", "pass")
+                        if c2_action in ("flag", "veto"):
+                            log.debug("adaptive: ultra 2nd critic %s — returning revised anyway", c2_action)
+                    except:
+                        pass
+                self._record(user_input, revised, f"deep_{c_action}")
                 return revised
-        self._record(user_input, draft, "fallback")
+
+        self._record(user_input, draft, f"fallback_c{complexity}")
         return draft
 
     async def review(self, target, ctx=None):

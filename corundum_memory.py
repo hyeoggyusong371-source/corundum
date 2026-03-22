@@ -48,6 +48,14 @@ except ImportError:
     EMBED_OK = False
     log.warning("memory: sentence-transformers not found, using keyword fallback")
 
+try:
+    import hnswlib as _hnswlib
+    HNSWLIB_OK = True
+    log.info("memory: hnswlib loaded — fast ANN search enabled")
+except ImportError:
+    HNSWLIB_OK = False
+    log.warning("memory: hnswlib not found — using numpy fallback")
+
 
 def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
@@ -370,38 +378,63 @@ class LightKG:
 
 class VectorIndex:
     """
-    Sentence-transformers vector search.
-    Falls back to keyword search when unavailable.
+    ANN 벡터 검색.
+    hnswlib 있으면 HNSW 인덱스 사용 (빠름, 확장성).
+    없으면 numpy 배열 폴백.
 
     Composite score = cosine_similarity * ebbinghaus_decay * (1 + importance)
     Access count extends half-life (frequently used memories persist longer).
     """
     HALF_LIFE_BASE = 86400.0 * 3
     HALF_LIFE_MAX  = 86400.0 * 30
+    DIM            = 384
+    MAX_ELEMENTS   = 2000   # hnswlib 최대 원소 수 (동적 resize 지원)
 
     def __init__(self):
         self._texts:      List[str]   = []
-        self._vectors:    List        = []
         self._ts:         List[float] = []
         self._importance: List[float] = []
         self._access:     List[int]   = []
+        self._vectors:    List        = []   # numpy 폴백용
+
+        if HNSWLIB_OK and EMBED_OK:
+            self._index = _hnswlib.Index(space="cosine", dim=self.DIM)
+            self._index.init_index(max_elements=self.MAX_ELEMENTS, ef_construction=200, M=16)
+            self._index.set_ef(50)
+            self._use_hnsw = True
+        else:
+            self._index    = None
+            self._use_hnsw = False
 
     def add(self, text: str, importance: float = 0.5):
         if not EMBED_OK:
             return
         try:
-            vec = _EMBED_MODEL.encode(text, convert_to_numpy=True)
+            import numpy as np
+            vec = _EMBED_MODEL.encode(text, convert_to_numpy=True).astype("float32")
+            idx = len(self._texts)
+
             self._texts.append(text)
-            self._vectors.append(vec)
             self._ts.append(time.time())
             self._importance.append(clamp(importance))
             self._access.append(0)
-            if len(self._texts) > 500:
-                self._texts      = self._texts[-400:]
-                self._vectors    = self._vectors[-400:]
-                self._ts         = self._ts[-400:]
-                self._importance = self._importance[-400:]
-                self._access     = self._access[-400:]
+
+            if self._use_hnsw:
+                # hnswlib: 최대 원소 초과 시 동적 resize
+                if idx >= self._index.get_max_elements():
+                    new_max = self._index.get_max_elements() + 500
+                    self._index.resize_index(new_max)
+                self._index.add_items(vec.reshape(1, -1), [idx])
+            else:
+                self._vectors.append(vec)
+                # numpy 폴백: 2000개 초과 시 슬라이싱
+                if len(self._texts) > 2000:
+                    self._texts      = self._texts[-1600:]
+                    self._vectors    = self._vectors[-1600:]
+                    self._ts         = self._ts[-1600:]
+                    self._importance = self._importance[-1600:]
+                    self._access     = self._access[-1600:]
+
         except Exception as e:
             log.debug("vector_index: add failed: %s", e)
 
@@ -416,32 +449,59 @@ class VectorIndex:
             return []
         try:
             import numpy as np
-            q_vec  = _EMBED_MODEL.encode(query, convert_to_numpy=True)
-            matrix = np.array(self._vectors)
-            cos    = matrix @ q_vec / (np.linalg.norm(matrix, axis=1) * np.linalg.norm(q_vec) + 1e-9)
+            q_vec = _EMBED_MODEL.encode(query, convert_to_numpy=True).astype("float32")
+            n     = len(self._texts)
 
-            # 후보를 넉넉하게 뽑은 뒤 MMR로 줄임
-            fetch_k = min(len(self._texts), max(top_k * 3, 20))
-            top_raw = sorted(range(len(cos)), key=lambda i: cos[i], reverse=True)[:fetch_k]
-            raw_scores = [float(cos[i]) for i in top_raw]
+            if self._use_hnsw and self._index and self._index.get_current_count() > 0:
+                # hnswlib: ANN 검색
+                fetch_k   = min(n, max(top_k * 3, 20))
+                labels, distances = self._index.knn_query(q_vec.reshape(1, -1), k=fetch_k)
+                top_raw    = [int(l) for l in labels[0] if int(l) < n]
+                # cosine distance → similarity
+                raw_scores = [max(0.0, 1.0 - float(d)) for d in distances[0][:len(top_raw)]]
+            else:
+                # numpy 폴백
+                matrix    = np.array(self._vectors)
+                cos       = matrix @ q_vec / (np.linalg.norm(matrix, axis=1) * np.linalg.norm(q_vec) + 1e-9)
+                fetch_k   = min(n, max(top_k * 3, 20))
+                top_raw   = sorted(range(n), key=lambda i: cos[i], reverse=True)[:fetch_k]
+                raw_scores = [float(cos[i]) for i in top_raw]
 
             selected = _mmr_select(
                 indices  = top_raw,
                 scores   = raw_scores,
-                vectors  = self._vectors,
+                vectors  = [_EMBED_MODEL.encode(self._texts[i], convert_to_numpy=True) for i in top_raw],
                 ts_list  = self._ts,
                 k        = top_k,
             )
 
             results = []
             for i in selected:
-                if cos[i] > 0.3:
+                score = raw_scores[top_raw.index(i)] if i in top_raw else 0.0
+                if score > 0.3:
                     self._access[i] += 1
                     results.append(self._texts[i])
             return results
         except Exception as e:
             log.debug("vector_index: search failed: %s", e)
             return []
+
+    def rebuild_hnsw(self):
+        """hnswlib 인덱스 재구축 (sleep_prune 후 호출 가능)."""
+        if not (self._use_hnsw and EMBED_OK):
+            return
+        try:
+            import numpy as np
+            self._index = _hnswlib.Index(space="cosine", dim=self.DIM)
+            self._index.init_index(max_elements=max(len(self._texts) + 100, self.MAX_ELEMENTS),
+                                   ef_construction=200, M=16)
+            self._index.set_ef(50)
+            for i, text in enumerate(self._texts):
+                vec = _EMBED_MODEL.encode(text, convert_to_numpy=True).astype("float32")
+                self._index.add_items(vec.reshape(1, -1), [i])
+            log.info("vector_index: hnswlib 재구축 완료 (%d items)", len(self._texts))
+        except Exception as e:
+            log.warning("vector_index: rebuild_hnsw 실패: %s", e)
 
 
 # ── persistence (SQLite) ──────────────────────────────────────────────────────

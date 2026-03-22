@@ -30,6 +30,7 @@ class Cfg:
     GOAL_MODEL   = os.environ.get("CORUNDUM_GOAL_MODEL",   "deepseek-r1:14b")
     LOGIC_MODEL  = os.environ.get("CORUNDUM_LOGIC_MODEL",  "exaone3.5:32b")
     CRITIC_MODEL = os.environ.get("CORUNDUM_CRITIC_MODEL", "deepseek-r1:14b")
+    VISION_MODEL = os.environ.get("CORUNDUM_VISION_MODEL", "qwen2.5-vl:7b")
 
     # temperature
     TEMP_JUDGE  = 0.75
@@ -42,6 +43,7 @@ class Cfg:
     TIMEOUT_GOAL   = 45.0
     TIMEOUT_LOGIC  = 120.0
     TIMEOUT_CRITIC = 45.0
+    TIMEOUT_VISION = 20.0
 
     # gear별 physio_loop 주기 (sec). 숫자가 클수록 느리게 동작.
     # emotion gear가 우선 적용되고, 이 값은 fallback으로 사용됨.

@@ -166,7 +166,7 @@ class CorundumVision:
             Cfg = _get_cfg()
             resp = await asyncio.wait_for(
                 AsyncClient().chat(
-                    model=Cfg.JUDGE_MODEL,  # 코런덤은 JUDGE_MODEL로 비전 처리
+                    model=Cfg.VISION_MODEL,   # VL 전용 모델
                     messages=[{
                         "role": "user",
                         "content": [
@@ -177,7 +177,7 @@ class CorundumVision:
                     system=self._VIS_SYS,
                     options={"temperature": 0.1, "num_predict": 300},
                 ),
-                timeout=Cfg.TIMEOUT_JUDGE,
+                timeout=Cfg.TIMEOUT_VISION,
             )
             data = _safe_parse_json(resp["message"]["content"])
             if data:
@@ -186,6 +186,8 @@ class CorundumVision:
                 state.ocr_text    = data.get("text_content", "")
                 if data.get("has_error") == "true" and data.get("error_summary"):
                     state.description += f" [오류: {data['error_summary']}]"
+        except asyncio.TimeoutError:
+            log.debug("[Vision] 타임아웃 — 화면 설명 없이 진행")
         except Exception as e:
             log.debug("[Vision] 이해 실패: %s", e)
         return state
@@ -422,16 +424,216 @@ class CorundumSemanticAnchor:
 
     async def find_element(self, role: str = "", text: str = "",
                            screenshot_b64: str = "") -> Optional[UIElement]:
+        """AT-SPI → UIAuto → OCR → VLM 순으로 UI 요소 탐색."""
+        # 1. 접근성 트리
         tree = await self.get_tree()
         for elem in tree:
             if elem.matches(role=role, text=text):
-                log.debug("[Anchor] 발견(%s): %s", elem.source, elem.name[:30])
+                log.debug("[Anchor] 발견(tree/%s): %s", elem.source, elem.name[:30])
                 return elem
+
+        # 2. OCR 폴백
+        if text:
+            for elem in await self._ocr_elements(screenshot_b64):
+                if elem.matches(role=role, text=text):
+                    log.debug("[Anchor] 발견(OCR): %s", elem.name[:30])
+                    return elem
+
+        # 3. VLM 최후 수단
+        if screenshot_b64 and (role or text):
+            elem = await self._vlm_find(f"role={role} text={text}", screenshot_b64)
+            if elem:
+                log.debug("[Anchor] 발견(VLM): %s", elem.name[:30])
+                return elem
+
+        log.debug("[Anchor] 요소 없음: role=%r text=%r", role, text)
+        return None
+
+    async def _ocr_elements(self, screenshot_b64: str = "") -> List[UIElement]:
+        if not (PYAUTOGUI_OK and PIL_OK):
+            return []
+        return await asyncio.get_event_loop().run_in_executor(
+            None, self._sync_ocr, screenshot_b64
+        )
+
+    def _sync_ocr(self, screenshot_b64: str) -> List[UIElement]:
+        elems: List[UIElement] = []
+        try:
+            import pytesseract
+            from PIL import Image
+            import io as _io
+            if screenshot_b64:
+                img = Image.open(_io.BytesIO(base64.b64decode(screenshot_b64)))
+            else:
+                img = pyautogui.screenshot()
+            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+            for i in range(len(data["text"])):
+                txt = data["text"][i].strip()
+                if not txt or data["conf"][i] < 40:
+                    continue
+                elems.append(UIElement(
+                    role="text", name=txt,
+                    x=data["left"][i], y=data["top"][i],
+                    width=data["width"][i], height=data["height"][i],
+                    source="ocr",
+                ))
+        except Exception as ex:
+            log.debug("[Anchor/OCR] 실패: %s", ex)
+        return elems
+
+    async def _vlm_find(self, description: str, screenshot_b64: str) -> Optional[UIElement]:
+        try:
+            from ollama import AsyncClient
+            Cfg = _get_cfg()
+            prompt = (
+                f"화면에서 다음 UI 요소를 찾아 좌표를 반환해:\n찾는 요소: {description}\n\n"
+                '응답 형식 (JSON만):\n{"found":true,"x":정수,"y":정수,"w":정수,"h":정수,"role":"역할","name":"텍스트"}'
+            )
+            resp = await asyncio.wait_for(
+                AsyncClient().chat(
+                    model=Cfg.VISION_MODEL,
+                    messages=[{"role": "user", "content": [
+                        {"type": "image", "data": screenshot_b64},
+                        {"type": "text",  "text": prompt},
+                    ]}],
+                    options={"temperature": 0.1, "num_predict": 128},
+                ),
+                timeout=Cfg.TIMEOUT_VISION,
+            )
+            data = _safe_parse_json(resp["message"]["content"])
+            if data.get("found"):
+                return UIElement(
+                    role=data.get("role", "unknown"),
+                    name=data.get("name", ""),
+                    x=int(data["x"]), y=int(data["y"]),
+                    width=int(data.get("w", 50)), height=int(data.get("h", 30)),
+                    source="vlm",
+                )
+        except Exception as ex:
+            log.debug("[Anchor/VLM] 실패: %s", ex)
         return None
 
     def invalidate(self):
         self._cache_ts = 0.0
         self._cache    = []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CorundumPlanner — 목표 분해 + 재플래닝
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SubTask:
+    idx:         int
+    description: str
+    done:        bool  = False
+    failed:      bool  = False
+    output:      str   = ""
+
+    def to_str(self) -> str:
+        mark = "✓" if self.done else ("✗" if self.failed else "○")
+        return f"[{mark}] {self.idx+1}. {self.description[:60]}"
+
+
+class CorundumPlanner:
+    """
+    목표를 서브태스크로 분해하고 실행 순서를 관리.
+    실패 시 재플래닝 가능.
+    """
+    _PLAN_SYS = (
+        "/no_think\n"
+        "너는 코런덤의 플래너야.\n"
+        "주어진 목표를 구체적이고 순차적인 서브태스크로 분해해.\n\n"
+        "규칙:\n"
+        "- 최대 8개 서브태스크\n"
+        "- 각 태스크는 독립적으로 실행 가능한 단위\n"
+        "- 터미널 우선, GUI는 필요할 때만\n"
+        '응답(JSON만): {"subtasks": ["태스크1", "태스크2", ...]}'
+    )
+    _REPLAN_SYS = (
+        "/no_think\n"
+        "너는 코런덤의 플래너야.\n"
+        "서브태스크가 실패했어. 나머지 계획을 수정해.\n\n"
+        "규칙:\n"
+        "- 실패한 태스크를 다른 방법으로 대체하거나 건너뛰어\n"
+        "- 최대 5개\n"
+        '응답(JSON만): {"subtasks": ["수정된 태스크1", ...]}'
+    )
+    _FORMAT = {
+        "type": "object",
+        "properties": {"subtasks": {"type": "array", "items": {"type": "string"}}},
+        "required": ["subtasks"],
+    }
+
+    def __init__(self):
+        self.plan:    List[SubTask] = []
+        self._replan_count: int    = 0
+        self._MAX_REPLAN: int      = 2
+
+    async def make_plan(self, goal: str) -> List[SubTask]:
+        """목표 → 서브태스크 리스트."""
+        raw = await self._call(goal, self._PLAN_SYS)
+        subtasks = self._parse(raw)
+        if not subtasks:
+            subtasks = [goal]  # 분해 실패 시 목표 자체를 단일 태스크로
+        self.plan = [SubTask(idx=i, description=t) for i, t in enumerate(subtasks)]
+        log.info("[Planner] 플랜 생성: %d 태스크", len(self.plan))
+        return self.plan
+
+    async def replan(self, failed_task: SubTask, remaining: List[SubTask]) -> List[SubTask]:
+        """실패한 태스크 이후 계획 수정."""
+        if self._replan_count >= self._MAX_REPLAN:
+            log.info("[Planner] 재플래닝 한도 초과")
+            return remaining
+        self._replan_count += 1
+        prompt = (
+            f"실패한 태스크: {failed_task.description}\n"
+            f"남은 태스크:\n" +
+            "\n".join(f"- {t.description}" for t in remaining)
+        )
+        raw      = await self._call(prompt, self._REPLAN_SYS)
+        new_descs = self._parse(raw)
+        if not new_descs:
+            return remaining
+        base_idx = failed_task.idx + 1
+        new_tasks = [SubTask(idx=base_idx + i, description=d) for i, d in enumerate(new_descs)]
+        log.info("[Planner] 재플래닝: %d → %d 태스크", len(remaining), len(new_tasks))
+        return new_tasks
+
+    def plan_summary(self) -> str:
+        if not self.plan:
+            return "플랜 없음"
+        return "\n".join(t.to_str() for t in self.plan)
+
+    def _parse(self, raw: str) -> List[str]:
+        try:
+            import json
+            data = json.loads(raw)
+        except Exception:
+            data = _safe_parse_json(raw)
+        items = data.get("subtasks", [])
+        return [str(s).strip() for s in items if str(s).strip()][:8]
+
+    async def _call(self, prompt: str, sys_p: str) -> str:
+        try:
+            from ollama import AsyncClient
+            Cfg = _get_cfg()
+            resp = await asyncio.wait_for(
+                AsyncClient().chat(
+                    model=Cfg.JUDGE_MODEL,
+                    messages=[
+                        {"role": "system", "content": sys_p},
+                        {"role": "user",   "content": prompt},
+                    ],
+                    format=self._FORMAT,
+                    options={"temperature": 0.3, "num_predict": 512},
+                ),
+                timeout=Cfg.TIMEOUT_JUDGE,
+            )
+            return resp["message"]["content"].strip()
+        except Exception as e:
+            log.debug("[Planner] LLM 실패: %s", e)
+            return "{}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -466,6 +668,11 @@ class CorundumBrain:
         self.vision = CorundumVision()
         self.actor  = CorundumActor(safe_mode=safe_mode)
         self.anchor = CorundumSemanticAnchor()
+        self._kg    = None   # CorundumComputer에서 주입
+
+    def set_kg(self, kg):
+        """LightKG 인스턴스 주입 — 메모리 연동용."""
+        self._kg = kg
 
     async def execute_goal(
         self,
@@ -477,6 +684,19 @@ class CorundumBrain:
         Cfg         = _get_cfg()
         steps_taken = []
         outputs     = []
+
+        # KG에서 앱/목표 관련 힌트 조회
+        kg_hint = ""
+        if self._kg:
+            keywords = [w for w in goal.split() if len(w) >= 3][:3]
+            hints = []
+            for kw in keywords:
+                h = self._kg.query(kw, top_k=2)
+                if h:
+                    hints.append(h)
+            if hints:
+                kg_hint = "[과거 경험]\n" + "\n".join(hints[:4])
+                log.debug("[Brain] KG 힌트 주입: %d개", len(hints))
 
         try:
             from ollama import AsyncClient
@@ -508,6 +728,7 @@ class CorundumBrain:
                 f"현재 상태: {screen_summary}\n"
                 f"단계: {step_n + 1}/{self.MAX_STEPS}\n"
                 f"이전 행동:\n{recent}"
+                + (f"\n{kg_hint}" if kg_hint and step_n == 0 else "")
             )
 
             if not OLLAMA_OK:
@@ -590,13 +811,58 @@ class CorundumBrain:
 
             if not result.success:
                 if sum(1 for s in steps_taken[-3:] if not s["success"]) >= 3:
-                    return {"success": False, "steps": steps_taken,
-                            "output": "\n".join(outputs[-3:]), "reason": "연속 실패"}
+                    # 전략 전환 시도
+                    strategy = self._recover_strategy(steps_taken, goal)
+                    if strategy:
+                        log.info("[Brain] 실패 복구 전략 전환: %s", strategy)
+                        if on_action:
+                            on_action(None, ActionResult(success=False,
+                                      error=f"전략 전환: {strategy}"))
+                        # 전환 힌트를 goal에 주입해서 다음 스텝에서 반영
+                        goal = f"{goal}\n[복구 힌트] {strategy}"
+                        # 연속 실패 카운터 리셋을 위해 더미 성공 레코드 삽입
+                        steps_taken.append({
+                            "step": step_n, "action": "recover",
+                            "reason": strategy, "success": True,
+                            "output": "전략 전환",
+                        })
+                    else:
+                        return {"success": False, "steps": steps_taken,
+                                "output": "\n".join(outputs[-3:]), "reason": "연속 실패 — 복구 전략 없음"}
 
             await asyncio.sleep(0.4)
 
         return {"success": False, "steps": steps_taken,
                 "output": "\n".join(outputs[-3:]), "reason": "최대 단계 도달"}
+
+    def _recover_strategy(self, steps: List[Dict], goal: str) -> Optional[str]:
+        """
+        연속 실패 시 전략 전환 힌트 반환.
+        최근 3개 실패 액션 패턴 분석 → 다른 접근 제안.
+        두 번 이상 같은 전략 전환을 시도하면 None 반환 (무한루프 방지).
+        """
+        recent = steps[-6:]
+        failed_actions = [s["action"] for s in recent if not s.get("success", True)]
+        recover_count  = sum(1 for s in recent if s.get("action") == "recover")
+
+        if recover_count >= 2:
+            return None  # 이미 두 번 전환했으면 포기
+
+        # GUI 액션 연속 실패 → 터미널로 전환
+        gui_actions = {"click", "double_click", "type", "type_raw", "key", "scroll", "move"}
+        if all(a in gui_actions for a in failed_actions[-3:]):
+            return "GUI 조작 실패 — run_command로 터미널에서 직접 처리 시도"
+
+        # 터미널 명령 연속 실패 → GUI로 전환
+        if all(a == "run_command" for a in failed_actions[-3:]):
+            return "터미널 명령 실패 — GUI 직접 조작으로 전환 시도"
+
+        # 파일 작업 실패 → 경로/권한 확인
+        if all(a in ("read_file", "write_file") for a in failed_actions[-3:]):
+            return "파일 접근 실패 — 경로 확인 및 권한 체크 필요 (ls -la, pwd 등)"
+
+        # 혼합 실패 → 스크린샷 찍고 현재 상태 재파악
+        return "현재 상태 불명확 — screenshot으로 화면 재파악 후 재시도"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -606,10 +872,38 @@ class CorundumBrain:
 class CorundumComputer:
     def __init__(self, safe_mode: bool = True):
         self._brain   = CorundumBrain(safe_mode=safe_mode)
+        self._planner = CorundumPlanner()
         self._run_log: deque = deque(maxlen=30)
+        self._kg      = None  # CorundumAgency에서 주입
 
     def set_anchor(self, anchor: CorundumSemanticAnchor):
         self._brain.anchor = anchor
+
+    def set_kg(self, kg):
+        """LightKG 주입 — 성공/실패 패턴 저장 + 힌트 조회."""
+        self._kg = kg
+        self._brain.set_kg(kg)
+
+    def _save_pattern(self, goal: str, steps: List[Dict], success: bool):
+        """성공/실패 패턴을 KG에 저장."""
+        if not self._kg or not steps:
+            return
+        try:
+            # 가장 많이 쓴 액션 타입 추출
+            action_counts: Dict[str, int] = {}
+            for s in steps:
+                a = s.get("action", "")
+                action_counts[a] = action_counts.get(a, 0) + 1
+            if not action_counts:
+                return
+            dominant = max(action_counts, key=lambda k: action_counts[k])
+            goal_kw  = goal[:20].strip()
+            rel      = "성공패턴" if success else "실패패턴"
+            conf     = 0.7 if success else 0.3
+            self._kg.upsert(goal_kw, rel, dominant, confidence=conf)
+            log.debug("[Computer] KG 저장: %s --%s--> %s", goal_kw, rel, dominant)
+        except Exception as e:
+            log.debug("[Computer] KG 저장 실패: %s", e)
 
     async def execute(
         self,
@@ -617,25 +911,74 @@ class CorundumComputer:
         on_status: Optional[Callable] = None,
         confirm_fn=None,
         cogn_interval: float = 1.5,
+        use_planner: bool = True,
     ) -> Dict:
         log.info("[Computer] 목표: %s", goal[:60])
 
         def _on_action(action, result):
+            if action is None:
+                return
             msg = f"[{action.action_type}] {'✓' if result.success else '✗'} {action.reason[:40]}"
             if result.output:
                 msg += f"\n  → {str(result.output)[:100]}"
             if on_status:
                 on_status(msg)
 
-        result = await self._brain.execute_goal(
-            goal, on_action=_on_action,
-            confirm_fn=confirm_fn, cogn_interval=cogn_interval,
-        )
-        self._run_log.append({
-            "ts": time.time(), "goal": goal[:60],
-            "success": result.get("success", False),
-        })
-        return result
+        # 단순 목표는 플래너 없이 직접 실행
+        if not use_planner or len(goal) < 30:
+            result = await self._brain.execute_goal(
+                goal, on_action=_on_action,
+                confirm_fn=confirm_fn, cogn_interval=cogn_interval,
+            )
+            self._save_pattern(goal, result.get("steps", []), result.get("success", False))
+            self._run_log.append({"ts": time.time(), "goal": goal[:60], "success": result.get("success", False)})
+            return result
+
+        # 복잡한 목표 → 플래너로 분해 후 서브태스크 순차 실행
+        subtasks = await self._planner.make_plan(goal)
+        if on_status:
+            on_status(f"[Planner] {len(subtasks)}개 태스크로 분해\n{self._planner.plan_summary()}")
+
+        all_steps:   List[Dict] = []
+        all_outputs: List[str]  = []
+        remaining = list(subtasks)
+
+        while remaining:
+            task = remaining.pop(0)
+            if on_status:
+                on_status(f"[Planner] 태스크 {task.idx+1}: {task.description[:50]}")
+
+            result = await self._brain.execute_goal(
+                task.description,
+                on_action=_on_action,
+                confirm_fn=confirm_fn,
+                cogn_interval=cogn_interval,
+            )
+            all_steps.extend(result.get("steps", []))
+            if result.get("output"):
+                all_outputs.append(result["output"])
+
+            if result.get("success"):
+                task.done   = True
+                task.output = result.get("output", "")
+            else:
+                task.failed = True
+                log.info("[Planner] 태스크 실패: %s — 재플래닝 시도", task.description[:40])
+                remaining = await self._planner.replan(task, remaining)
+                if not remaining:
+                    break
+
+        success = all(t.done for t in subtasks if not t.failed)
+        final   = {
+            "success": success,
+            "steps":   all_steps,
+            "output":  "\n".join(all_outputs[-5:]),
+            "reason":  "플래너 완료" if success else "일부 태스크 실패",
+            "plan":    self._planner.plan_summary(),
+        }
+        self._save_pattern(goal, all_steps, success)
+        self._run_log.append({"ts": time.time(), "goal": goal[:60], "success": success})
+        return final
 
     def recent_log(self, n: int = 5) -> List[Dict]:
         return list(self._run_log)[-n:]

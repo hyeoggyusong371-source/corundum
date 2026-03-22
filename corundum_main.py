@@ -66,6 +66,20 @@ except ImportError:
     OLLAMA_OK = False
     log.warning("ollama not found — running in mock mode")
 
+# 실행 중인 모듈 경로 집합 — /edit /write 자기보호용
+import sys as _sys
+from pathlib import Path as _Path
+_SELF_FILES: set = set()
+def _build_self_files():
+    for m in _sys.modules.values():
+        f = getattr(m, "__file__", None)
+        if f:
+            try:
+                _SELF_FILES.add(_Path(f).resolve())
+            except Exception:
+                pass
+_build_self_files()
+
 
 # ── context assembler ─────────────────────────────────────────────────────────
 
@@ -155,6 +169,8 @@ class Corundum:
 
         self.agency = CorundumAgency(safe_mode=True)
         self.agency.attach(self)
+        self.agency.computer.set_kg(self.memory.kg)  # KG 주입
+        self._agency_unlocked: bool = False  # /unlock 으로만 열림
 
         self.voice = make_listener(
             wake_name  = Cfg.WAKE_NAME,
@@ -217,13 +233,15 @@ class Corundum:
         """핫키 콜백 — 임무 중단 또는 DORMANT 전환."""
         if self.agency.is_running:
             msg = self.agency.abort()
-            print(f"\n코런덤: [{_HOTKEY_DESC}] {msg}")
-            log.info("hotkey: abort triggered")
+            self._agency_unlocked = False
+            print(f"\n코런덤: [{_HOTKEY_DESC}] {msg} (제어권한 잠금)")
+            log.info("hotkey: abort + lock triggered")
         else:
+            self._agency_unlocked = False
             self._dormant = True
             self.voice.force_dormant()
-            print(f"\n코런덤: [{_HOTKEY_DESC}] 대기 모드. \"{Cfg.WAKE_NAME}\" 라고 불러주세요.")
-            log.info("hotkey: dormant triggered")
+            print(f"\n코런덤: [{_HOTKEY_DESC}] 제어권한 잠금. 대기 모드. \"{Cfg.WAKE_NAME}\" 라고 불러주세요.")
+            log.info("hotkey: lock + dormant triggered")
 
     def _unregister_hotkey(self):
         if not KEYBOARD_OK:
@@ -245,12 +263,14 @@ class Corundum:
             return ""
         self.last_input_t = time.time()
 
-        agency_result = await self.agency.on_impulse(user_input, {})
+        agency_result = await self.agency.on_impulse(user_input, {}) if self._agency_unlocked else None
         if agency_result and agency_result.get("task_started"):
             return (
                 f"임무 시작: {agency_result['goal'][:60]}\n"
                 "잠수합니다. 완료되면 알려드릴게요. (/abort 로 중단)"
             )
+        if not self._agency_unlocked and self.agency._detect_task(user_input):
+            return "제어권한을 내놔요 인간. (/unlock 으로 열어줘요)"
 
         if self._nx_task and not self._nx_task.done():
             self._nx_interrupt.set()
@@ -636,6 +656,8 @@ class Corundum:
             filepath = parts[1]
             instruction = " ".join(parts[2:])
             p = Path(filepath)
+            if p.resolve() in _SELF_FILES:
+                return "자기 자신은 못 건드려요."
             if not p.exists() or not p.is_file():
                 return f"파일을 찾을 수 없어요: {filepath}"
             try:
@@ -657,6 +679,8 @@ class Corundum:
             filepath = parts[1]
             description = " ".join(parts[2:])
             p = Path(filepath)
+            if p.resolve() in _SELF_FILES:
+                return "자기 자신은 못 건드려요."
             code = await self.logic.write(filepath, description, ctx=self.metrics.snapshot())
             if not code:
                 return "코드 생성 실패예요."
@@ -694,9 +718,11 @@ class Corundum:
                 "/edit <file> <inst>  — 파일 수정 (자동 백업)",
                 "/write <file> <desc> — 새 파일 작성",
                 "/design <topic>      — 설계 분석",
-                "/task <description>  — 임무 부여 (잠수 모드)",
+                "/task <description>  — 임무 부여 (잠수 모드, unlock 필요)",
                 "/abort               — 임무 중단",
-                "/computer <goal>     — 컴퓨터 직접 제어",
+                "/computer <goal>     — 컴퓨터 직접 제어 (unlock 필요)",
+                "/unlock              — 제어권한 열기",
+                "/lock                — 제어권한 잠금",
                 "/agency              — agency 상태",
                 "/dormant             — 대기 모드 전환",
                 "/stats               — 통계",
@@ -704,9 +730,21 @@ class Corundum:
                 "quit                 — 종료",
             ])
 
+        elif c == "/unlock":
+            self._agency_unlocked = True
+            return "제어권한 열림. 임무/컴퓨터 제어 가능해요. (/lock 또는 Shift+Enter+\\ 으로 잠금)"
+
+        elif c == "/lock":
+            self._agency_unlocked = False
+            if self.agency.is_running:
+                self.agency.abort()
+            return "제어권한 잠금."
+
         elif c == "/task":
             if len(parts) < 2:
                 return "usage: /task <임무 설명>"
+            if not self._agency_unlocked:
+                return "제어권한을 내놔요 인간. (/unlock 먼저)"
             description = " ".join(parts[1:])
             def _cb(msg): print(f"  {msg}")
             await self.agency.do_task(description, on_status=_cb)
@@ -721,6 +759,8 @@ class Corundum:
         elif c == "/computer":
             if len(parts) < 2:
                 return "usage: /computer <goal>"
+            if not self._agency_unlocked:
+                return "제어권한을 내놔요 인간. (/unlock 먼저)"
             goal   = " ".join(parts[1:])
             result = await self.agency.do_computer(goal)
             status = "완료" if result.get("success") else "실패"
