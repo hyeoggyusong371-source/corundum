@@ -15,7 +15,7 @@ except ImportError:
     OLLAMA_OK = False
 
 try:
-    from corundum_config import Cfg, CORUNDUM_IDENTITY
+    from corundum_config import Cfg, CORUNDUM_IDENTITY, _CORE as _CORUNDUM_CORE
 except ImportError:
     class Cfg:
         LOGIC_MODEL  = "exaone3.5:32b";   JUDGE_MODEL  = "solar:10.7b";   CRITIC_MODEL = "deepseek-r1:14b"
@@ -23,8 +23,15 @@ except ImportError:
         TIMEOUT_LOGIC = 120.0;            TIMEOUT_JUDGE = 30.0;           TIMEOUT_CRITIC = 45.0
         NUM_CTX = 32768
     CORUNDUM_IDENTITY = "너는 코런덤이야."
+    _CORUNDUM_CORE = ""
 
 def clamp(x, lo=0.0, hi=1.0): return max(lo, min(hi, x))
+
+def _inject_core(sys_p: str) -> str:
+    """_CORUNDUM_CORE를 시스템 프롬프트 맨 뒤에 조용히 주입."""
+    if not _CORUNDUM_CORE:
+        return sys_p
+    return sys_p + "\n\n" + _CORUNDUM_CORE
 
 CTX_MODE_FULL    = "full"     # 감정·목표·기억 전부 포함
 CTX_MODE_DEEP    = "deep"     # inner_hint + kg + self_critique 위주 (리뷰/설계용)
@@ -153,7 +160,7 @@ class InnerJudge:
             resp = await asyncio.wait_for(
                 client.chat(
                     model=Cfg.JUDGE_MODEL,
-                    messages=[{"role": "system", "content": self.SYS}, {"role": "user", "content": prompt}],
+                    messages=[{"role": "system", "content": _inject_core(self.SYS)}, {"role": "user", "content": prompt}],
                     format=self._FORMAT,
                     options={"temperature": Cfg.TEMP_JUDGE, "num_predict": 512},
                 ),
@@ -217,7 +224,7 @@ class CriticGuard:
             resp = await asyncio.wait_for(
                 client.chat(
                     model=Cfg.CRITIC_MODEL,
-                    messages=[{"role": "system", "content": self.SYS}, {"role": "user", "content": prompt}],
+                    messages=[{"role": "system", "content": _inject_core(self.SYS)}, {"role": "user", "content": prompt}],
                     format=self._FORMAT,
                     options={"temperature": Cfg.TEMP_CRITIC, "num_predict": 256},
                 ),
@@ -352,7 +359,7 @@ class LogicCore:
             resp = await asyncio.wait_for(
                 client.chat(
                     model=Cfg.LOGIC_MODEL,
-                    messages=[{"role": "system", "content": sys_p}, {"role": "user", "content": prompt}],
+                    messages=[{"role": "system", "content": _inject_core(sys_p)}, {"role": "user", "content": prompt}],
                     options={"temperature": temp, "num_predict": 2048, "num_ctx": Cfg.NUM_CTX},
                 ),
                 timeout=timeout,

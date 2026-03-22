@@ -7,7 +7,7 @@ import copy
 import logging
 import os
 import time
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 from importlib import import_module as _im
 
 log = logging.getLogger("corundum")
@@ -27,6 +27,37 @@ MetricsEngine   = _im("corundum_metrics").MetricsEngine
 
 from corundum_agency import CorundumAgency
 from corundum_voice  import make_listener
+
+import platform as _platform
+_OS = _platform.system()  # "Windows" | "Darwin" | "Linux"
+
+# ── 핫키 백엔드 (Shift+Enter+\ — 전 OS 동일) ─────────────────────────────────
+# Windows / Linux : keyboard 라이브러리
+# macOS           : pynput (keyboard는 macOS에서 루트 없이 불안정)
+#
+# 세 키 동시: shift + enter + backslash
+# keyboard  조합 문자열 : "shift+enter+\\"
+# pynput    조합 문자열 : "<shift>+<enter>+\\"
+KEYBOARD_OK      = False
+_keyboard_mod    = None
+_pynput_kb       = None
+
+_HOTKEY_KEYBOARD = "shift+enter+\\"          # keyboard 라이브러리용
+_HOTKEY_PYNPUT   = "<shift>+<enter>+\\"      # pynput GlobalHotKeys용
+_HOTKEY_DESC     = "Shift+Enter+\\"
+
+if _OS in ("Windows", "Linux"):
+    try:
+        import keyboard as _keyboard_mod
+        KEYBOARD_OK = True
+    except ImportError:
+        log.warning("keyboard 없음 — 핫키 비활성화 (pip install keyboard)")
+else:  # Darwin + 기타
+    try:
+        from pynput import keyboard as _pynput_kb
+        KEYBOARD_OK = True
+    except ImportError:
+        log.warning("pynput 없음 — 핫키 비활성화 (pip install pynput)")
 
 try:
     from ollama import AsyncClient as OllamaClient
@@ -144,6 +175,8 @@ class Corundum:
         self._nx_task:      Optional[asyncio.Task] = None
         self._nx_interrupt: asyncio.Event          = asyncio.Event()
 
+        self._register_hotkey()
+
         log.info("corundum: ready")
         self._print_status()
 
@@ -155,6 +188,55 @@ class Corundum:
             f"logic:{Cfg.LOGIC_MODEL} | "
             f"judge:{Cfg.JUDGE_MODEL}"
         )
+
+    # ── hotkey ────────────────────────────────────────────────────────────────
+
+    def _register_hotkey(self):
+        """Shift+Enter+\\ 글로벌 핫키 등록. 의존성 없으면 조용히 스킵.
+        Windows / Linux : keyboard 라이브러리
+        macOS           : pynput GlobalHotKeys
+        """
+        if not KEYBOARD_OK:
+            return
+        try:
+            if _OS in ("Windows", "Linux"):
+                _keyboard_mod.add_hotkey(
+                    _HOTKEY_KEYBOARD, self._hotkey_abort, suppress=False
+                )
+            else:  # Darwin
+                from pynput.keyboard import GlobalHotKeys
+                self._pynput_listener = GlobalHotKeys(
+                    {_HOTKEY_PYNPUT: self._hotkey_abort}
+                )
+                self._pynput_listener.start()
+            log.info("hotkey: %s → abort/dormant 등록됨", _HOTKEY_DESC)
+        except Exception as e:
+            log.warning("hotkey: 등록 실패 (권한 문제일 수 있음): %s", e)
+
+    def _hotkey_abort(self):
+        """핫키 콜백 — 임무 중단 또는 DORMANT 전환."""
+        if self.agency.is_running:
+            msg = self.agency.abort()
+            print(f"\n코런덤: [{_HOTKEY_DESC}] {msg}")
+            log.info("hotkey: abort triggered")
+        else:
+            self._dormant = True
+            self.voice.force_dormant()
+            print(f"\n코런덤: [{_HOTKEY_DESC}] 대기 모드. \"{Cfg.WAKE_NAME}\" 라고 불러주세요.")
+            log.info("hotkey: dormant triggered")
+
+    def _unregister_hotkey(self):
+        if not KEYBOARD_OK:
+            return
+        try:
+            if _OS in ("Windows", "Linux"):
+                _keyboard_mod.remove_hotkey(_HOTKEY_KEYBOARD)
+            else:  # Darwin
+                if hasattr(self, "_pynput_listener"):
+                    self._pynput_listener.stop()
+            log.info("hotkey: 해제됨")
+        except Exception:
+            pass
 
     # ── main process ──────────────────────────────────────────────────────────
 
@@ -454,6 +536,7 @@ class Corundum:
         physio_task.cancel()
         auto_task.cancel()
         self.voice.stop()
+        self._unregister_hotkey()
         await asyncio.gather(physio_task, auto_task, return_exceptions=True)
         await self.memory.save()
         print("\n[ CORUNDUM session ended ]")

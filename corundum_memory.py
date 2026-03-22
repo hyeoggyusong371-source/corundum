@@ -53,6 +53,77 @@ def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
+# ── MMR 유틸 ──────────────────────────────────────────────────────────────────
+
+_MMR_LAMBDA   = 0.65   # 1.0 = 순수 유사도, 0.0 = 순수 다양성
+_TIME_DECAY_K = 1e-6   # exp(-k * age_sec) — 약 11일에 절반
+
+
+def _time_decay(ts: float) -> float:
+    age = max(0.0, time.time() - ts)
+    return math.exp(-_TIME_DECAY_K * age)
+
+
+def _cosine_np(a, b) -> float:
+    import numpy as np
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na < 1e-9 or nb < 1e-9:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def _mmr_select(
+    indices: List[int],
+    scores: List[float],
+    vectors: List,
+    ts_list: List[float],
+    k: int,
+    lam: float = _MMR_LAMBDA,
+) -> List[int]:
+    """MMR 재순위 — 관련성과 다양성 균형. 시간 감쇠를 초기 점수에 적용."""
+    if not indices:
+        return []
+    try:
+        import numpy as np
+        decayed = [s * _time_decay(ts_list[i]) for s, i in zip(scores, indices)]
+        selected: List[int] = []
+        remaining = list(range(len(indices)))
+        for _ in range(min(k, len(indices))):
+            if not remaining:
+                break
+            best_pos, best_score = -1, -float("inf")
+            for pos in remaining:
+                rel = decayed[pos]
+                if not selected:
+                    mmr_s = rel
+                else:
+                    max_sim = max(
+                        _cosine_np(vectors[indices[pos]], vectors[indices[sel]])
+                        for sel in selected
+                    )
+                    mmr_s = lam * rel - (1.0 - lam) * max_sim
+                if mmr_s > best_score:
+                    best_score, best_pos = mmr_s, pos
+            selected.append(best_pos)
+            remaining.remove(best_pos)
+        return [indices[i] for i in selected]
+    except Exception as e:
+        log.debug("mmr_select fallback: %s", e)
+        return [i for _, i in sorted(zip(scores, indices), reverse=True)[:k]]
+
+
+# ── gear → layer 매핑 ─────────────────────────────────────────────────────────
+
+def _gear_to_layer(gear: str) -> int:
+    """SURFACE=0 / VORTEX=1 / DEEP=2"""
+    return {
+        "OVERDRIVE": 2, "FOCUS": 2,
+        "THINK": 1, "NORMAL": 1,
+        "SAVE": 0, "LOW": 0, "SLEEP": 0, "DREAM": 0,
+    }.get(gear, 1)
+
+
 # ── episode memory ────────────────────────────────────────────────────────────
 
 @dataclass
@@ -98,6 +169,39 @@ class EpisodeMemory:
                 scored.append((overlap, ep))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [ep for _, ep in scored[:top_k]]
+
+    def sleep_prune(self, min_nodes: int = 30) -> int:
+        """
+        SLEEP/DREAM gear 때 호출 — 중요도 하위 항목 정리.
+        min_nodes 미만이면 손대지 않음.
+        Returns: 삭제된 수
+        """
+        nodes = list(self.long_term)
+        if len(nodes) < min_nodes:
+            return 0
+
+        _IMP_KW = {"버그", "오류", "에러", "설계", "보안", "취약", "중요", "핵심", "수정", "리뷰"}
+
+        def _importance(ep: Episode) -> float:
+            score = ep.importance
+            score += min((time.time() - ep.ts) / 86400.0 * -0.01, 0.0)  # 오래될수록 소폭 감소
+            if any(kw in ep.text for kw in _IMP_KW):
+                score += 0.2
+            return clamp(score)
+
+        scored = sorted(nodes, key=_importance)
+        # 하위 10% 삭제
+        n_delete = max(0, int(len(scored) * 0.10))
+        to_delete = set(id(ep) for ep in scored[:n_delete])
+
+        before = len(self.long_term)
+        self.long_term = deque(
+            (ep for ep in self.long_term if id(ep) not in to_delete),
+            maxlen=self.LONG_MAXLEN,
+        )
+        deleted = before - len(self.long_term)
+        log.info("sleep_prune: removed %d episodes", deleted)
+        return deleted
 
 
 # ── snippet memory ────────────────────────────────────────────────────────────
@@ -315,10 +419,22 @@ class VectorIndex:
             q_vec  = _EMBED_MODEL.encode(query, convert_to_numpy=True)
             matrix = np.array(self._vectors)
             cos    = matrix @ q_vec / (np.linalg.norm(matrix, axis=1) * np.linalg.norm(q_vec) + 1e-9)
-            comp   = [cos[i] * self._decay(i) * (1.0 + self._importance[i]) for i in range(len(self._texts))]
-            top    = sorted(range(len(comp)), key=lambda i: comp[i], reverse=True)[:top_k]
+
+            # 후보를 넉넉하게 뽑은 뒤 MMR로 줄임
+            fetch_k = min(len(self._texts), max(top_k * 3, 20))
+            top_raw = sorted(range(len(cos)), key=lambda i: cos[i], reverse=True)[:fetch_k]
+            raw_scores = [float(cos[i]) for i in top_raw]
+
+            selected = _mmr_select(
+                indices  = top_raw,
+                scores   = raw_scores,
+                vectors  = self._vectors,
+                ts_list  = self._ts,
+                k        = top_k,
+            )
+
             results = []
-            for i in top:
+            for i in selected:
                 if cos[i] > 0.3:
                     self._access[i] += 1
                     results.append(self._texts[i])
@@ -469,24 +585,37 @@ class CorundumMemory:
 
     def _fetch_raw(self, user_input: str, metrics_ctx: Dict) -> Dict:
         energy = metrics_ctx.get("energy", 1.0)
+        gear   = metrics_ctx.get("gear", "NORMAL")
+        layer  = _gear_to_layer(gear)
         top_k  = max(2, int(getattr(Cfg, "MEMORY_TOP_K", 4) * energy))
+
+        # layer별 검색 깊이
+        # SURFACE(0): 벡터만
+        # VORTEX (1): 벡터 + KG top-2
+        # DEEP   (2): 벡터 + KG top-4 + 최근 에피소드 추가
+        if layer >= 2:
+            top_k = min(top_k + 2, 8)
 
         if EMBED_OK:
             similar_texts = self.vectors.search(user_input, top_k=top_k)
         else:
             similar_texts = [ep.text for ep in self.episodes.keyword_recall(user_input, top_k=top_k)]
 
-        keywords = [w for w in user_input.split() if len(w) >= 3][:3]
         kg_lines = []
-        for kw in keywords:
-            hint = self.kg.query(kw, top_k=2)
-            if hint:
-                kg_lines.append(hint)
+        if layer >= 1:
+            keywords = [w for w in user_input.split() if len(w) >= 3][:3]
+            kg_top_k = 4 if layer >= 2 else 2
+            for kw in keywords:
+                hint = self.kg.query(kw, top_k=kg_top_k)
+                if hint:
+                    kg_lines.append(hint)
 
+        working_n = 8 if layer >= 2 else 6
         return {
             "_raw_texts": similar_texts,
             "_kg_lines":  kg_lines,
-            "_working":   self.episodes.working_context(n=6),
+            "_working":   self.episodes.working_context(n=working_n),
+            "_layer":     layer,
         }
 
     def _refine(self, raw: Dict, user_input: str) -> Dict:
@@ -522,14 +651,17 @@ class CorundumMemory:
 
     async def consolidate(self):
         if len(self.episodes.long_term) >= EpisodeMemory.LONG_MAXLEN * 0.9:
-            sorted_eps = sorted(self.episodes.long_term, key=lambda e: e.importance)
-            to_remove  = sorted_eps[:10]
-            for ep in to_remove:
-                try:
-                    self.episodes.long_term.remove(ep)
-                except ValueError:
-                    pass
-            log.info("memory: consolidated, removed %d episodes", len(to_remove))
+            pruned = self.episodes.sleep_prune(min_nodes=30)
+            if pruned == 0:
+                # prune로 못 줄였으면 기존 단순 정렬로 폴백
+                sorted_eps = sorted(self.episodes.long_term, key=lambda e: e.importance)
+                to_remove  = sorted_eps[:10]
+                for ep in to_remove:
+                    try:
+                        self.episodes.long_term.remove(ep)
+                    except ValueError:
+                        pass
+                log.info("memory: fallback consolidate, removed %d episodes", len(to_remove))
 
     async def save(self):
         try:
